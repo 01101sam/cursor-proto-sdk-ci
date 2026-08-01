@@ -38,8 +38,8 @@ jobs:
         env:
           PRIVATE_RUNNER_PAT: ${{ secrets.PRIVATE_RUNNER_PAT }}
           PRIVATE_REPO: ${{ inputs.private_repo }}
-          RUNNER_NAME: ${{ inputs.runner_name }}
-          RUNNER_LABELS: ${{ inputs.labels }}
+          EPH_NAME: ${{ inputs.runner_name }}
+          EPH_LABELS: ${{ inputs.labels }}
         run: |
           set -euo pipefail
           test -n "${PRIVATE_RUNNER_PAT}"
@@ -74,9 +74,11 @@ jobs:
           ./config.sh --unattended --ephemeral \
             --url "https://github.com/${PRIVATE_REPO}" \
             --token "${TOKEN}" \
-            --name "${RUNNER_NAME}" \
-            --labels "${RUNNER_LABELS}" \
+            --name "${EPH_NAME}" \
+            --labels "${EPH_LABELS}" \
             --replace
+          # RUNNER_* is a reserved prefix on hosted images; confirm the name stuck.
+          test "$(jq -r .agentName .runner)" = "${EPH_NAME}"
           echo "BOOTSTRAPPED=${HOME}/runner" >> "$GITHUB_ENV"
 
       - name: Bootstrap
@@ -85,8 +87,8 @@ jobs:
         env:
           PRIVATE_RUNNER_PAT: ${{ secrets.PRIVATE_RUNNER_PAT }}
           PRIVATE_REPO: ${{ inputs.private_repo }}
-          RUNNER_NAME: ${{ inputs.runner_name }}
-          RUNNER_LABELS: ${{ inputs.labels }}
+          EPH_NAME: ${{ inputs.runner_name }}
+          EPH_LABELS: ${{ inputs.labels }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ([string]::IsNullOrEmpty($env:PRIVATE_RUNNER_PAT)) { throw 'PRIVATE_RUNNER_PAT is empty' }
@@ -122,10 +124,13 @@ jobs:
             & .\config.cmd --unattended --ephemeral `
               --url "https://github.com/$($env:PRIVATE_REPO)" `
               --token $token `
-              --name $env:RUNNER_NAME `
-              --labels $env:RUNNER_LABELS `
+              --name $env:EPH_NAME `
+              --labels $env:EPH_LABELS `
               --replace
             if ($LASTEXITCODE -ne 0) { throw "config.cmd failed: $LASTEXITCODE" }
+            # RUNNER_* is a reserved prefix on hosted images; confirm the name stuck.
+            $agent = (Get-Content .runner -Raw | ConvertFrom-Json).agentName
+            if ($agent -ne $env:EPH_NAME) { throw "runner name mismatch: $agent" }
           } finally {
             Pop-Location
           }
@@ -187,7 +192,7 @@ jobs:
         env:
           PRIVATE_RUNNER_PAT: ${{ secrets.PRIVATE_RUNNER_PAT }}
           PRIVATE_REPO: ${{ inputs.private_repo }}
-          RUNNER_NAME: ${{ inputs.runner_name }}
+          EPH_NAME: ${{ inputs.runner_name }}
         run: |
           set -euo pipefail
           echo "::add-mask::${PRIVATE_RUNNER_PAT}"
@@ -197,7 +202,7 @@ jobs:
             -H "Authorization: Bearer ${PRIVATE_RUNNER_PAT}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${PRIVATE_REPO}/actions/runners?per_page=100")"
-          ID="$(echo "$BODY" | jq -r --arg n "$RUNNER_NAME" '.runners[] | select(.name==$n) | .id' | head -n1)"
+          ID="$(echo "$BODY" | jq -r --arg n "$EPH_NAME" '.runners[] | select(.name==$n) | .id' | head -n1)"
           if [ -n "${ID}" ]; then
             curl -fsSL -X DELETE \
               -H "Accept: application/vnd.github+json" \
@@ -215,7 +220,7 @@ jobs:
         env:
           PRIVATE_RUNNER_PAT: ${{ secrets.PRIVATE_RUNNER_PAT }}
           PRIVATE_REPO: ${{ inputs.private_repo }}
-          RUNNER_NAME: ${{ inputs.runner_name }}
+          EPH_NAME: ${{ inputs.runner_name }}
         run: |
           $ErrorActionPreference = 'Continue'
           Write-Output "::add-mask::$($env:PRIVATE_RUNNER_PAT)"
@@ -228,7 +233,7 @@ jobs:
             $body = Invoke-RestMethod -Method GET `
               -Uri "https://api.github.com/repos/$($env:PRIVATE_REPO)/actions/runners?per_page=100" `
               -Headers $headers
-            $match = @($body.runners | Where-Object { $_.name -eq $env:RUNNER_NAME }) | Select-Object -First 1
+            $match = @($body.runners | Where-Object { $_.name -eq $env:EPH_NAME }) | Select-Object -First 1
             if ($null -ne $match) {
               Invoke-RestMethod -Method DELETE `
                 -Uri "https://api.github.com/repos/$($env:PRIVATE_REPO)/actions/runners/$($match.id)" `
