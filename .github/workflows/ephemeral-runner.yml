@@ -1,0 +1,245 @@
+name: ephemeral-runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      private_repo:
+        description: owner/repo to register into
+        required: true
+        default: 01101sam/cursor-proto-sdk
+      runner_name:
+        description: unique runner name
+        required: true
+        type: string
+      labels:
+        description: extra labels (comma-separated, no spaces)
+        required: true
+        type: string
+      runs_on:
+        description: github-hosted image
+        required: true
+        type: string
+      idle_timeout_min:
+        description: minutes to wait for a job before exiting
+        required: true
+        default: "45"
+        type: string
+
+jobs:
+  serve:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 180
+    steps:
+      - name: Bootstrap
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          PRIVATE_RUNNER_PAT: ${{ secrets.PRIVATE_RUNNER_PAT }}
+          PRIVATE_REPO: ${{ inputs.private_repo }}
+          RUNNER_NAME: ${{ inputs.runner_name }}
+          RUNNER_LABELS: ${{ inputs.labels }}
+        run: |
+          set -euo pipefail
+          test -n "${PRIVATE_RUNNER_PAT}"
+          echo "::add-mask::${PRIVATE_RUNNER_PAT}"
+
+          TOKEN="$(curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${PRIVATE_RUNNER_PAT}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/actions/runners/registration-token" \
+            | jq -r .token)"
+          echo "::add-mask::${TOKEN}"
+          test -n "${TOKEN}" && test "${TOKEN}" != "null"
+
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+          case "${OS}-${ARCH}" in
+            Linux-x86_64)   PKG=actions-runner-linux-x64 ;;
+            Linux-aarch64)  PKG=actions-runner-linux-arm64 ;;
+            Darwin-arm64)   PKG=actions-runner-osx-arm64 ;;
+            Darwin-x86_64)  PKG=actions-runner-osx-x64 ;;
+            *) echo "unsupported ${OS}-${ARCH}"; exit 1 ;;
+          esac
+
+          # Pinned 2026-08-01 from https://github.com/actions/runner/releases/latest
+          VER=2.336.0
+          curl -fsSL -o /tmp/runner.tgz \
+            "https://github.com/actions/runner/releases/download/v${VER}/${PKG}-${VER}.tar.gz"
+          mkdir -p "${HOME}/runner"
+          tar -C "${HOME}/runner" -xzf /tmp/runner.tgz
+          cd "${HOME}/runner"
+          ./config.sh --unattended --ephemeral \
+            --url "https://github.com/${PRIVATE_REPO}" \
+            --token "${TOKEN}" \
+            --name "${RUNNER_NAME}" \
+            --labels "${RUNNER_LABELS}" \
+            --replace
+          echo "BOOTSTRAPPED=${HOME}/runner" >> "$GITHUB_ENV"
+
+      - name: Bootstrap
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PRIVATE_RUNNER_PAT: ${{ secrets.PRIVATE_RUNNER_PAT }}
+          PRIVATE_REPO: ${{ inputs.private_repo }}
+          RUNNER_NAME: ${{ inputs.runner_name }}
+          RUNNER_LABELS: ${{ inputs.labels }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrEmpty($env:PRIVATE_RUNNER_PAT)) { throw 'PRIVATE_RUNNER_PAT is empty' }
+          Write-Output "::add-mask::$($env:PRIVATE_RUNNER_PAT)"
+
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $($env:PRIVATE_RUNNER_PAT)"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $reg = Invoke-RestMethod -Method POST `
+            -Uri "https://api.github.com/repos/$($env:PRIVATE_REPO)/actions/runners/registration-token" `
+            -Headers $headers
+          $token = $reg.token
+          if ([string]::IsNullOrEmpty($token) -or $token -eq 'null') { throw 'registration token missing' }
+          Write-Output "::add-mask::$token"
+
+          $pkg = switch ($env:PROCESSOR_ARCHITECTURE) {
+            'AMD64' { 'actions-runner-win-x64' }
+            'ARM64' { 'actions-runner-win-arm64' }
+            default { throw "unsupported $($env:PROCESSOR_ARCHITECTURE)" }
+          }
+
+          # Pinned 2026-08-01 from https://github.com/actions/runner/releases/latest
+          $ver = '2.336.0'
+          $zip = Join-Path $env:RUNNER_TEMP 'runner.zip'
+          $dest = Join-Path $HOME 'runner'
+          Invoke-WebRequest -Uri "https://github.com/actions/runner/releases/download/v$ver/$pkg-$ver.zip" -OutFile $zip
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          Push-Location $dest
+          try {
+            & .\config.cmd --unattended --ephemeral `
+              --url "https://github.com/$($env:PRIVATE_REPO)" `
+              --token $token `
+              --name $env:RUNNER_NAME `
+              --labels $env:RUNNER_LABELS `
+              --replace
+            if ($LASTEXITCODE -ne 0) { throw "config.cmd failed: $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+          "BOOTSTRAPPED=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Serve
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          IDLE_TIMEOUT_MIN: ${{ inputs.idle_timeout_min }}
+        run: |
+          set -euo pipefail
+          cd "${BOOTSTRAPPED}"
+          # runner exits after one job when --ephemeral
+          ./run.sh &
+          PID=$!
+          SECS=$(( IDLE_TIMEOUT_MIN * 60 ))
+          while kill -0 "$PID" 2>/dev/null; do
+            if [ "$SECS" -le 0 ]; then
+              echo "idle/serve timeout"
+              kill "$PID" 2>/dev/null || true
+              wait "$PID" || true
+              exit 1
+            fi
+            sleep 10
+            SECS=$(( SECS - 10 ))
+          done
+          wait "$PID"
+
+      - name: Serve
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          IDLE_TIMEOUT_MIN: ${{ inputs.idle_timeout_min }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrEmpty($env:BOOTSTRAPPED)) { throw 'BOOTSTRAPPED is empty' }
+          Set-Location $env:BOOTSTRAPPED
+          $proc = Start-Process -FilePath (Join-Path $env:BOOTSTRAPPED 'run.cmd') `
+            -WorkingDirectory $env:BOOTSTRAPPED `
+            -PassThru -NoNewWindow
+          $secs = [int]$env:IDLE_TIMEOUT_MIN * 60
+          while (-not $proc.HasExited) {
+            if ($secs -le 0) {
+              Write-Host 'idle/serve timeout'
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              Get-Process -Name 'Runner.Listener','Runner.Worker' -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+              exit 1
+            }
+            Start-Sleep -Seconds 10
+            $secs -= 10
+          }
+          if ($proc.ExitCode -ne 0) { exit $proc.ExitCode }
+
+      - name: Cleanup
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        env:
+          PRIVATE_RUNNER_PAT: ${{ secrets.PRIVATE_RUNNER_PAT }}
+          PRIVATE_REPO: ${{ inputs.private_repo }}
+          RUNNER_NAME: ${{ inputs.runner_name }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${PRIVATE_RUNNER_PAT}"
+          # Best-effort remove if still registered
+          BODY="$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${PRIVATE_RUNNER_PAT}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/actions/runners?per_page=100")"
+          ID="$(echo "$BODY" | jq -r --arg n "$RUNNER_NAME" '.runners[] | select(.name==$n) | .id' | head -n1)"
+          if [ -n "${ID}" ]; then
+            curl -fsSL -X DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${PRIVATE_RUNNER_PAT}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${PRIVATE_REPO}/actions/runners/${ID}" || true
+          fi
+          if [ -d "${HOME}/runner" ]; then
+            (cd "${HOME}/runner" && ./config.sh remove --token "${PRIVATE_RUNNER_PAT}" 2>/dev/null) || true
+          fi
+
+      - name: Cleanup
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PRIVATE_RUNNER_PAT: ${{ secrets.PRIVATE_RUNNER_PAT }}
+          PRIVATE_REPO: ${{ inputs.private_repo }}
+          RUNNER_NAME: ${{ inputs.runner_name }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Output "::add-mask::$($env:PRIVATE_RUNNER_PAT)"
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $($env:PRIVATE_RUNNER_PAT)"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          try {
+            $body = Invoke-RestMethod -Method GET `
+              -Uri "https://api.github.com/repos/$($env:PRIVATE_REPO)/actions/runners?per_page=100" `
+              -Headers $headers
+            $match = @($body.runners | Where-Object { $_.name -eq $env:RUNNER_NAME }) | Select-Object -First 1
+            if ($null -ne $match) {
+              Invoke-RestMethod -Method DELETE `
+                -Uri "https://api.github.com/repos/$($env:PRIVATE_REPO)/actions/runners/$($match.id)" `
+                -Headers $headers | Out-Null
+            }
+          } catch {
+            Write-Host "cleanup API best-effort: $($_.Exception.Message)"
+          }
+          $dest = Join-Path $HOME 'runner'
+          if (Test-Path $dest) {
+            Push-Location $dest
+            try {
+              & .\config.cmd remove --token $env:PRIVATE_RUNNER_PAT 2>$null
+            } catch {}
+            Pop-Location
+          }
