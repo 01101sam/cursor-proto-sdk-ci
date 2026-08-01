@@ -1,2 +1,3 @@
 # cursor-proto-sdk-ci
-Actions-only ephemeral runner bootstrap (no source)
+
+Public Actions bootstrap repo. No project source. Do not store secrets in issues/PRs.
