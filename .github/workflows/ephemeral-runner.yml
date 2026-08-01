@@ -1,5 +1,7 @@
 name: ephemeral-runner
 
+run-name: ${{ inputs.runner_name }}
+
 on:
   workflow_dispatch:
     inputs:
